@@ -323,7 +323,8 @@ extern byte realtimeMode;           // used in getMappedPixelIndex()
 #define FX_MODE_ROCKTAVES              185
 #define FX_MODE_2DAKEMI                186
 
-#define MODE_COUNT                     187
+// really important change for auto mode change to work since there is a check that requested mode is not higher than this!!
+#define MODE_COUNT                     200
 
 typedef enum mapping1D2D {
   M12_Pixels = 0,

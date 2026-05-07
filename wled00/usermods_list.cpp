@@ -222,6 +222,10 @@
   #include "../usermods/stairway_wipe_basic/stairway-wipe-usermod-v2.h"
 #endif
 
+#ifdef USERMOD_WEATHER_CLOUD
+  #include "../usermods/WeatherCloud/usermod_weather_cloud.h"
+#endif
+
 #ifdef USERMOD_MAX17048
   #include "../usermods/MAX17048_v2/usermod_max17048.h"
 #endif
@@ -450,6 +454,10 @@ void registerUsermods()
 
   #ifdef USERMOD_STAIRCASE_WIPE
   UsermodManager::add(new StairwayWipeUsermod());
+  #endif
+
+  #ifdef USERMOD_WEATHER_CLOUD
+  UsermodManager::add(new WeatherCloudMod());
   #endif
 
   #ifdef USERMOD_MAX17048
