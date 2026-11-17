@@ -1,4 +1,3 @@
-#pragma once
 
 #include "wled.h"
 #include <HTTPClient.h>
@@ -26,28 +25,45 @@
  */
 enum API_OPTIONS { DWD_BRIGHTSKY = 0, OPENWEATHERMAP = 1 };
 
-// mode (effect) id for the weather mode which displays current weather
-uint16_t WEATHER_EFFECT_ID = 187;
+// usermod id (kept local instead of in wled00/const.h to avoid core changes)
+#ifndef USERMOD_ID_WEATHER_CLOUD
+#define USERMOD_ID_WEATHER_CLOUD 200
+#endif
 
-// Weather animations
+// Weather animations (internal state only - these are NOT effect ids).
+// Effect ids are assigned dynamically by strip.addEffect(255, ...) since
+// WLED 16 ships with more built-in effects and fixed ids would collide.
 enum WeatherAnimation {
   ANIM_NONE = 0,
-  ANIM_CLEAR = 190,
-  ANIM_PARTLY_CLOUDY = 191,
-  ANIM_CLOUDY = 192,
-  ANIM_RAIN = 193,
-  ANIM_SNOW = 194,
-  ANIM_NIGHT = 195,
-  ANIM_WIND = 196,
-  ANIM_THUNDERSTORM = 197,
-  ANIM_FOG = 198,
-  ANIM_HAIL = 199
+  ANIM_CLEAR,
+  ANIM_PARTLY_CLOUDY,
+  ANIM_CLOUDY,
+  ANIM_RAIN,
+  ANIM_SNOW,
+  ANIM_NIGHT,
+  ANIM_WIND,
+  ANIM_THUNDERSTORM,
+  ANIM_FOG,
+  ANIM_HAIL
 };
 
-WeatherAnimation currentWeatherAnimation = WeatherAnimation::ANIM_NONE;
+static WeatherAnimation currentWeatherAnimation = WeatherAnimation::ANIM_NONE;
+
+// effect metadata strings (must live in PROGMEM)
+static const char _data_FX_MODE_WEATHER[] PROGMEM = "Weather@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_CLEAR[] PROGMEM = "WeatherClearSky@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_PARTLY_CLOUDY[] PROGMEM = "WeatherPartlyCloudy@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_CLOUDY[] PROGMEM = "WeatherCloudy@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_RAIN[] PROGMEM = "WeatherRain@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_SNOW[] PROGMEM = "WeatherSnow@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_NIGHT[] PROGMEM = "WeatherNight@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_WIND[] PROGMEM = "WeatherWind@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_THUNDERSTORM[] PROGMEM = "WeatherThunderstorm@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_FOG[] PROGMEM = "WeatherFog@!;<empty>;;01";
+static const char _data_FX_MODE_WEATHER_HAIL[] PROGMEM = "WeatherHail@!;<empty>;;01";
 
 // Should be done
-uint16_t mode_clear_sky() {
+static void mode_clear_sky() {
   static uint16_t clearSunPosition = 0;
   static unsigned long clearLastUpdate = 0;
 
@@ -74,11 +90,11 @@ uint16_t mode_clear_sky() {
     SEGMENT.setPixelColor(pos, ((uint32_t)255 << 16) | ((uint32_t)g << 8) | b);
   }
 
-  return FRAMETIME;
+  return;
 }
 
 // Should be done
-uint16_t mode_partly_cloudy() {
+static void mode_partly_cloudy() {
   static uint16_t partlyCloudySunPosition = 0;
   static unsigned long partlyCloudyLastUpdate = 0;
   static uint16_t blueSpotPositions[10] = {0}; // Store positions of blue spots
@@ -99,9 +115,9 @@ uint16_t mode_partly_cloudy() {
 
   // Update blue spots every 3 seconds
   if (millis() - spotUpdateTime > hw_random(15000, 20000)) {
-    numBlueSpots = random8(2, 5); // Random number of spots
+    numBlueSpots = hw_random8(2, 5); // Random number of spots
     for (int i = 0; i < numBlueSpots; i++) {
-      blueSpotPositions[i] = random16(SEGMENT.length());
+      blueSpotPositions[i] = hw_random16(SEGMENT.length());
     }
     spotUpdateTime = millis();
   }
@@ -129,20 +145,20 @@ uint16_t mode_partly_cloudy() {
     }
   }
 
-  return FRAMETIME;
+  return;
 }
 
 // done
-uint16_t mode_cloudy() {
+static void mode_cloudy() {
   // Very slow, subtle brightness variation to keep the cloud feeling alive
   static uint16_t cloudPhase = 0;
   cloudPhase++;
   // One full cycle ~17 s at 30 fps (cloudPhase >> 1 advances phase by
   // 0.5/frame)
-  uint8_t b = 70 + (uint8_t)((uint16_t)sin8(cloudPhase >> 1) * 90 /
+  uint8_t b = 70 + (uint8_t)((uint16_t)sin8_t(cloudPhase >> 1) * 90 /
                              255); // 70-160: visible breathing
   SEGMENT.fill(((uint32_t)b << 16) | ((uint32_t)b << 8) | b);
-  return FRAMETIME;
+  return;
 }
 
 // --- Persistent raindrop state -----------------------------------------------
@@ -161,18 +177,18 @@ struct Raindrop {
 static Raindrop raindrops[NUM_RAINDROPS];
 
 static void spawnRaindrop(Raindrop &d, uint16_t numLeds, bool stagger) {
-  d.pos = random16(numLeds);
-  d.peakBright = 70 + random8(130); // 70-200
-  d.fadeSpeed = 8 + random8(16);  // 8-24 per frame -> 270-830 ms fade at 30 fps
-  d.sustainLeft = 2 + random8(8); // 2-10 frames at peak
+  d.pos = hw_random16(numLeds);
+  d.peakBright = 70 + hw_random8(130); // 70-200
+  d.fadeSpeed = 8 + hw_random8(16);  // 8-24 per frame -> 270-830 ms fade at 30 fps
+  d.sustainLeft = 2 + hw_random8(8); // 2-10 frames at peak
   d.state = DROP_FADEIN;
-  d.brightness = stagger ? random8(d.peakBright) : 0;
+  d.brightness = stagger ? hw_random8(d.peakBright) : 0;
   if (stagger && d.brightness > d.peakBright / 2)
     d.state = DROP_FADEOUT;
 }
 
 // -----------------------------------------------------------------------------
-uint16_t mode_raining() {
+static void mode_raining() {
   static bool initialized = false;
   if (!initialized) {
     for (int i = 0; i < NUM_RAINDROPS; i++)
@@ -223,7 +239,7 @@ uint16_t mode_raining() {
       SEGMENT.setPixelColor(c + 1, color_blend(bgColor, dropColor, sideB));
   }
 
-  return FRAMETIME;
+  return;
 }
 
 #define NUM_SNOWFLAKES 5
@@ -239,11 +255,11 @@ void initSnowflakes(uint16_t numLeds) {
   for (int i = 0; i < NUM_SNOWFLAKES; i++) {
     snowflakes[i].pos = random(numLeds);
     snowflakes[i].speed =
-        0.01f + 0.04f * (random8() / 255.0f); // Speed between 0.01 and 0.05
+        0.01f + 0.04f * (hw_random8() / 255.0f); // Speed between 0.01 and 0.05
   }
 }
 
-uint16_t mode_snow(void) {
+static void mode_snow() {
   static bool initialized = false;
   if (!initialized) {
     initSnowflakes(SEGMENT.length());
@@ -270,7 +286,7 @@ uint16_t mode_snow(void) {
       if (dist >= (float)hw)
         continue;
       uint8_t angle = (uint8_t)(dist * 128.0f / (float)hw);
-      uint8_t t = cos8(angle);
+      uint8_t t = cos8_t(angle);
       // Cold blue-white
       uint8_t bl = (uint8_t)min(255, (int)t + (int)t / 5);
       SEGMENT.setPixelColor(led, ((uint32_t)t << 16) | ((uint32_t)t << 8) |
@@ -280,11 +296,11 @@ uint16_t mode_snow(void) {
     snowflakes[i].pos += snowflakes[i].speed;
     if (snowflakes[i].pos >= SEGMENT.length()) {
       snowflakes[i].pos = 0;
-      snowflakes[i].speed = 0.01f + 0.04f * (random8() / 255.0f);
+      snowflakes[i].speed = 0.01f + 0.04f * (hw_random8() / 255.0f);
     }
   }
 
-  return FRAMETIME;
+  return;
 }
 
 struct LightningBolt {
@@ -297,7 +313,7 @@ struct LightningBolt {
 
 LightningBolt lightningBolt;
 
-uint16_t mode_thunderstorm() {
+static void mode_thunderstorm() {
   static uint8_t lightningCooldown = 0;
   static uint8_t globalFlash = 0;
   static uint32_t frame = 0;
@@ -305,7 +321,7 @@ uint16_t mode_thunderstorm() {
 
   // 1. Fill with dark stormy blue
   for (uint16_t i = 0; i < SEGMENT.length(); i++) {
-    uint8_t flicker = random8((uint16_t)(i * 31 + frame * 17)) %
+    uint8_t flicker = hw_random8((uint16_t)(i * 31 + frame * 17)) %
                       10; // pseudo-random per pixel per frame
     SEGMENT.setPixelColor(i, ((0x00 + flicker) << 16) |
                                  ((0x00 + flicker) << 8) |
@@ -313,9 +329,9 @@ uint16_t mode_thunderstorm() {
   }
 
   // 2. Occasionally trigger a global flash (big lightning)
-  if (random8() < 3 && lightningCooldown == 0) {
+  if (hw_random8() < 3 && lightningCooldown == 0) {
     globalFlash = 255;
-    lightningCooldown = random8(10, 40); // Cooldown before next big flash
+    lightningCooldown = hw_random8(10, 40); // Cooldown before next big flash
   }
 
   // 3. Fade global flash
@@ -338,21 +354,21 @@ uint16_t mode_thunderstorm() {
       boltPause = false;
       boltStrikesLeft = 0; // Force new position on next strike
       lightningBolt.interval =
-          400 + random16(1200); // Normal interval for next strike (0.4-1.6s)
+          400 + hw_random16(1200); // Normal interval for next strike (0.4-1.6s)
     } else if (boltStrikesLeft == 0) {
       // New position, but add a pause before starting
-      lightningBolt.start = random16(SEGMENT.length() - 6);
-      lightningBolt.len = 3 + (random8() % 6); // Length 3-8
-      boltStrikesLeft = 2 + (random8() % 3);   // 2-4 strikes at this position
+      lightningBolt.start = hw_random16(SEGMENT.length() - 6);
+      lightningBolt.len = 3 + (hw_random8() % 6); // Length 3-8
+      boltStrikesLeft = 2 + (hw_random8() % 3);   // 2-4 strikes at this position
       boltPause = true;
       lightningBolt.interval =
-          800 + random16(2000); // Pause between positions (0.8-2.8s)
+          800 + hw_random16(2000); // Pause between positions (0.8-2.8s)
     } else {
       // Continue striking at current position
       lightningBolt.fade = 0;
       lightningBolt.lastTime = millis();
       lightningBolt.interval =
-          400 + random16(1200); // Normal interval for next strike (0.4-1.6s)
+          400 + hw_random16(1200); // Normal interval for next strike (0.4-1.6s)
       boltStrikesLeft--;
     }
     lightningBolt.lastTime = millis();
@@ -383,7 +399,7 @@ uint16_t mode_thunderstorm() {
   if (lightningCooldown > 0)
     lightningCooldown--;
 
-  return hw_random(40, 80); // Fast update for flicker and flashes
+  return;
 }
 
 #define NUM_WIND_SPOTS 3
@@ -401,14 +417,14 @@ void initWindSpots(uint16_t numLeds) {
   for (int i = 0; i < NUM_WIND_SPOTS; i++) {
     // Spread spots evenly so the whole cloud is lit
     windSpots[i].pos = (float)(numLeds / NUM_WIND_SPOTS * i) +
-                       random8(numLeds / NUM_WIND_SPOTS);
+                       hw_random16(numLeds / NUM_WIND_SPOTS);
     windSpots[i].speed =
-        0.10f + 0.10f * (random8() / 255.0f); // 0.10-0.20 per frame
-    windSpots[i].width = 8 + (random8() % 5); // Half-width 8-12
+        0.10f + 0.10f * (hw_random8() / 255.0f); // 0.10-0.20 per frame
+    windSpots[i].width = 8 + (hw_random8() % 5); // Half-width 8-12
   }
 }
 
-uint16_t mode_wind(void) {
+static void mode_wind() {
   static bool initialized = false;
   if (!initialized) {
     initWindSpots(SEGMENT.length());
@@ -430,7 +446,7 @@ uint16_t mode_wind(void) {
       int led = (centre + w + SEGMENT.length()) % SEGMENT.length();
       // cos8: 255 at centre (angle=0), 0 at edge (angle=128)
       uint8_t angle = (uint8_t)((uint32_t)abs(w) * 128 / hw);
-      uint8_t b = (uint8_t)((uint32_t)cos8(angle) * 180 / 255);
+      uint8_t b = (uint8_t)((uint32_t)cos8_t(angle) * 180 / 255);
       // Additive blend so overlapping spots combine naturally
       uint32_t existing = SEGMENT.getPixelColor(led);
       uint8_t er = (existing >> 16) & 0xFF;
@@ -443,7 +459,7 @@ uint16_t mode_wind(void) {
     }
   }
 
-  return FRAMETIME;
+  return;
 }
 
 #define NUM_STARS 8 // Adjust as needed
@@ -460,15 +476,15 @@ void initStars(uint16_t numLeds) {
   for (int i = 0; i < NUM_STARS; i++) {
     // Spread stars evenly so they cover the whole cloud
     uint16_t segLen = numLeds / NUM_STARS;
-    stars[i].pos = (uint16_t)(segLen * i + (segLen > 1 ? random8(segLen) : 0));
+    stars[i].pos = (uint16_t)(segLen * i + (segLen > 1 ? hw_random16(segLen) : 0));
     // Stagger initial phases so stars don't all brighten/dim together
     stars[i].phase = (uint8_t)(i * 256 / NUM_STARS);
     stars[i].speed =
-        1 + random8(3); // 1-3 per frame -> ~4-12 s full cycle at 30 fps
+        1 + hw_random8(3); // 1-3 per frame -> ~4-12 s full cycle at 30 fps
   }
 }
 
-uint16_t mode_night(void) {
+static void mode_night() {
   static bool initialized = false;
   if (!initialized) {
     initStars(SEGMENT.length());
@@ -481,7 +497,7 @@ uint16_t mode_night(void) {
   for (int i = 0; i < NUM_STARS; i++) {
     stars[i].phase += stars[i].speed;
     // sin8 returns 0..255; map to [20, 180] so stars are always faintly present
-    uint8_t b = 20 + (uint8_t)((uint16_t)sin8(stars[i].phase) * 160 / 255);
+    uint8_t b = 20 + (uint8_t)((uint16_t)sin8_t(stars[i].phase) * 160 / 255);
     int c = (int)stars[i].pos;
     // Soft 5-pixel gaussian-like spread: centre full, +-1 at 50%, +-2 at 12.5%
     // Blend additively so overlapping stars combine gracefully
@@ -514,7 +530,7 @@ uint16_t mode_night(void) {
     }
   }
 
-  return FRAMETIME;
+  return;
 }
 
 #define NUM_FOG_BANKS 3
@@ -531,12 +547,12 @@ static FogBank fogBanks[NUM_FOG_BANKS];
 void initFogBanks(uint16_t numLeds) {
   for (int i = 0; i < NUM_FOG_BANKS; i++) {
     fogBanks[i].pos = random(numLeds);
-    fogBanks[i].speed = 0.01 + 0.03 * (random8() / 255.0); // Very slow
-    fogBanks[i].width = 8 + (random8() % 8);               // Wide banks
+    fogBanks[i].speed = 0.01 + 0.03 * (hw_random8() / 255.0); // Very slow
+    fogBanks[i].width = 8 + (hw_random8() % 8);               // Wide banks
   }
 }
 
-uint16_t mode_fog(void) {
+static void mode_fog() {
   static bool initialized = false;
   if (!initialized) {
     initFogBanks(SEGMENT.length());
@@ -567,7 +583,7 @@ uint16_t mode_fog(void) {
     }
   }
 
-  return FRAMETIME;
+  return;
 }
 
 #define NUM_HAILSTONES 3
@@ -584,12 +600,12 @@ void initHailstones(uint16_t numLeds) {
   for (int i = 0; i < NUM_HAILSTONES; i++) {
     hailstones[i].pos = random(numLeds);
     hailstones[i].speed =
-        0.12f + 0.16f * (random8() / 255.0f); // 0.12-0.28 per frame
+        0.12f + 0.16f * (hw_random8() / 255.0f); // 0.12-0.28 per frame
     hailstones[i].width = 2;
   }
 }
 
-uint16_t mode_hail(void) {
+static void mode_hail() {
   static bool initialized = false;
   if (!initialized) {
     initHailstones(SEGMENT.length());
@@ -606,7 +622,7 @@ uint16_t mode_hail(void) {
     hailstones[h].pos += hailstones[h].speed;
     if (hailstones[h].pos >= SEGMENT.length()) {
       hailstones[h].pos = 0;
-      hailstones[h].speed = 0.12f + 0.16f * (random8() / 255.0f);
+      hailstones[h].speed = 0.12f + 0.16f * (hw_random8() / 255.0f);
       hailstones[h].width = 2;
     }
     // Sub-pixel 5-pixel Hann-window hailstone for smooth movement
@@ -622,7 +638,7 @@ uint16_t mode_hail(void) {
       if (dist >= (float)hw)
         continue;
       uint8_t angle = (uint8_t)(dist * 128.0f / (float)hw);
-      uint8_t t = cos8(angle);
+      uint8_t t = cos8_t(angle);
       // Icy blue colour scaled by brightness
       uint8_t r = (uint8_t)((uint32_t)0x21 * t / 255);
       uint8_t g = (uint8_t)((uint32_t)0x62 * t / 255);
@@ -631,7 +647,7 @@ uint16_t mode_hail(void) {
     }
   }
 
-  return FRAMETIME;
+  return;
 }
 
 // TODO move all weather thingys into seperate files?
@@ -642,7 +658,7 @@ uint16_t mode_hail(void) {
  * The all encompassing weather effect mode that picks the current weather on
  * itself
  */
-uint16_t mode_weather() {
+static void mode_weather() {
 
   // seg.setOption(SEG_OPTION_ON, true);
 
@@ -674,6 +690,9 @@ uint16_t mode_weather() {
   case ANIM_NIGHT:
     return mode_night();
     break;
+  case ANIM_HAIL:
+    return mode_hail();
+    break;
   // none and default defaulting to full red error cloud
   case ANIM_NONE:
   default:
@@ -692,7 +711,7 @@ uint16_t mode_weather() {
   // DEBUG_PRINT(F("New mode id: "));
   // DEBUG_PRINTLN(seg.currentMode());
 
-  return FRAMETIME;
+  return;
 }
 
 class WeatherCloudMod : public Usermod {
@@ -715,6 +734,7 @@ private:
   // Global variables for weather data
   String currentWeather = "clear";
   unsigned long lastUpdate = 0;
+  uint8_t weatherEffectId = 255;
 
   // Function to fetch weather data
   void updateWeather() {
@@ -732,6 +752,8 @@ private:
     int httpCode;
     String payload;
     String weather;
+    // the fetch blocks the main loop - keep it short so LEDs/audio sync don't stall long
+    http.setTimeout(3000);
 
     DEBUG_PRINT(F("Updating weather "));
     if (API_USED == API_OPTIONS::OPENWEATHERMAP) {
@@ -781,7 +803,6 @@ private:
 
       if (httpCode == 200) {
         payload = http.getString();
-        DynamicJsonDocument doc(1024);
         deserializeJson(doc, payload);
 
         weather = doc["weather"]["icon"].as<String>();
@@ -868,27 +889,21 @@ public:
   // Initialization
   void setup() {
     // TODO add speed and intensity to all of them
-    strip.addEffect(WEATHER_EFFECT_ID, &mode_weather, "Weather@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_CLEAR, &mode_clear_sky,
-                    "WeatherClearSky@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_PARTLY_CLOUDY, &mode_partly_cloudy,
-                    "WeatherPartlyCloudy@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_CLOUDY, &mode_cloudy,
-                    "WeatherCloudy@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_RAIN, &mode_raining,
-                    "WeatherRain@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_SNOW, &mode_snow,
-                    "WeatherSnow@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_NIGHT, &mode_night,
-                    "WeatherNight@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_WIND, &mode_wind,
-                    "WeatherWind@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_THUNDERSTORM, &mode_thunderstorm,
-                    "WeatherThunderstorm@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_FOG, &mode_fog,
-                    "WeatherFog@!;<empty>;;01");
-    strip.addEffect(WeatherAnimation::ANIM_HAIL, &mode_hail,
-                    "WeatherHail@!;<empty>;;01");
+    // id 255 = take the next free slot; ids are appended after built-in effects.
+    // Effects are referenced by name in the UI; presets store the numeric id,
+    // so re-save presets if the number of built-in effects changes.
+    weatherEffectId = strip.addEffect(255, &mode_weather, _data_FX_MODE_WEATHER);
+    strip.addEffect(255, &mode_clear_sky, _data_FX_MODE_WEATHER_CLEAR);
+    strip.addEffect(255, &mode_partly_cloudy, _data_FX_MODE_WEATHER_PARTLY_CLOUDY);
+    strip.addEffect(255, &mode_cloudy, _data_FX_MODE_WEATHER_CLOUDY);
+    strip.addEffect(255, &mode_raining, _data_FX_MODE_WEATHER_RAIN);
+    strip.addEffect(255, &mode_snow, _data_FX_MODE_WEATHER_SNOW);
+    strip.addEffect(255, &mode_night, _data_FX_MODE_WEATHER_NIGHT);
+    strip.addEffect(255, &mode_wind, _data_FX_MODE_WEATHER_WIND);
+    strip.addEffect(255, &mode_thunderstorm, _data_FX_MODE_WEATHER_THUNDERSTORM);
+    strip.addEffect(255, &mode_fog, _data_FX_MODE_WEATHER_FOG);
+    strip.addEffect(255, &mode_hail, _data_FX_MODE_WEATHER_HAIL);
+    DEBUG_PRINTF_P(PSTR("Weather effect registered with id %u\n"), weatherEffectId);
 
     // Turn on all section
     for (unsigned i = 0; i < strip.getSegmentsNum(); i++) {
@@ -904,11 +919,14 @@ public:
   void loop() {
     if (usermodEnabled) {
 
+      // updateWeather() rate-limits itself to UPDATE_INTERVAL.
+      // No delay() here: blocking the main loop throttles LED output and
+      // audio sync (UDP) reception for the audioreactive usermod.
       updateWeather();
-      // showAnimation();
-      delay(100); // Slow down updates to the LEDs
     }
   }
+
+  uint16_t getId() override { return USERMOD_ID_WEATHER_CLOUD; }
 
   /****** Config page stuff */
   // from
@@ -1053,3 +1071,6 @@ public:
     // oappend(currentWeather.c_str());
   }
 };
+
+static WeatherCloudMod weather_cloud;
+REGISTER_USERMOD(weather_cloud);

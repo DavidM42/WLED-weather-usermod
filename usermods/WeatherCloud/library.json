@@ -1,0 +1,7 @@
+{
+  "name": "WeatherCloud",
+  "build": { "libArchive": false },
+  "dependencies": {
+    "HTTPClient": "*"
+  }
+}
