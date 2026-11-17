@@ -49,669 +49,479 @@ enum WeatherAnimation {
 
 static WeatherAnimation currentWeatherAnimation = WeatherAnimation::ANIM_NONE;
 
-// effect metadata strings (must live in PROGMEM)
-static const char _data_FX_MODE_WEATHER[] PROGMEM = "Weather@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_CLEAR[] PROGMEM = "WeatherClearSky@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_PARTLY_CLOUDY[] PROGMEM = "WeatherPartlyCloudy@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_CLOUDY[] PROGMEM = "WeatherCloudy@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_RAIN[] PROGMEM = "WeatherRain@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_SNOW[] PROGMEM = "WeatherSnow@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_NIGHT[] PROGMEM = "WeatherNight@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_WIND[] PROGMEM = "WeatherWind@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_THUNDERSTORM[] PROGMEM = "WeatherThunderstorm@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_FOG[] PROGMEM = "WeatherFog@!;<empty>;;01";
-static const char _data_FX_MODE_WEATHER_HAIL[] PROGMEM = "WeatherHail@!;<empty>;;01";
+// ---------------------------------------------------------------------------
+// Weather effects
+//
+// Design notes:
+// - The lamp is a cotton cloud: the diffuser blurs neighbouring LEDs into a
+//   few large soft zones. So the effects work with broad, slowly changing
+//   areas (Perlin noise) and soft-edged particles instead of pixel detail.
+// - Everything is time based (strip.now), so the look does not depend on the
+//   frame rate. Rates are calibrated to how the effects looked when they were
+//   tuned (the old firmware ran at ~10 fps because of a delay() in loop()).
+// - WLED applies gamma correction on output (2.8 on this lamp), which turns
+//   raw channel values below ~40-50 fully off. Background levels are chosen
+//   to stay visible; the Ambient slider scales them.
+//
+// Sliders (all weather effects):
+//   Speed   (sx) 128 = calibrated speed
+//   Amount  (ix) 128 = original density (drops, flakes, strikes, cover, ...)
+//   Ambient (c1) 128 = default background glow, 0 = dark background
+// ---------------------------------------------------------------------------
 
-// Should be done
+#define WEATHER_FX_UI "@!,Amount,Ambient;;;01;sx=128,ix=128,c1=128"
+static const char _data_FX_MODE_WEATHER[] PROGMEM = "Weather" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_CLEAR[] PROGMEM = "WeatherClearSky" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_PARTLY_CLOUDY[] PROGMEM = "WeatherPartlyCloudy" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_CLOUDY[] PROGMEM = "WeatherCloudy" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_RAIN[] PROGMEM = "WeatherRain" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_SNOW[] PROGMEM = "WeatherSnow" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_NIGHT[] PROGMEM = "WeatherNight" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_WIND[] PROGMEM = "WeatherWind" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_THUNDERSTORM[] PROGMEM = "WeatherThunderstorm" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_FOG[] PROGMEM = "WeatherFog" WEATHER_FX_UI;
+static const char _data_FX_MODE_WEATHER_HAIL[] PROGMEM = "WeatherHail" WEATHER_FX_UI;
+
+// --- helpers ------------------------------------------------------------------
+
+// Seconds since this effect's previous frame, scaled by the speed slider.
+static float weatherDelta(uint32_t &lastMs) {
+  uint32_t now = strip.now;
+  uint32_t dt = lastMs ? now - lastMs : 0;
+  lastMs = now;
+  if (dt > 200) dt = 200; // first frame after a switch or a stall: don't jump
+  return dt * 0.001f * SEGMENT.speed * (1.0f / 128.0f);
+}
+
+// Advance a 16.16 noise coordinate by `cellsPerSecond` over `dt` seconds.
+static inline void advance(uint32_t &coord, float dt, float cellsPerSecond) {
+  coord += (uint32_t)(dt * cellsPerSecond * 65536.0f);
+}
+
+// Background colour scaled by the Ambient slider (128 = as given).
+static uint32_t ambientColor(uint8_t r, uint8_t g, uint8_t b) {
+  uint16_t a = SEGMENT.custom1;
+  return RGBW32(min(255, (r * a) >> 7), min(255, (g * a) >> 7),
+                min(255, (b * a) >> 7), 0);
+}
+
+// Smooth 0..255 texture. x/y are 16.16 noise coordinates. Contrast is
+// stretched x2 because raw Perlin output mostly stays around the middle.
+static uint8_t weatherNoise(uint32_t x, uint32_t y) {
+  int32_t n = 128 + ((int32_t)perlin16(x, y) - 32768) / 128;
+  return (uint8_t)constrain(n, 0, 255);
+}
+
+// Hann window: 1 at d=0, 0 at |d|>=1
+static inline float hann(float d) {
+  d = fabsf(d);
+  return d >= 1.0f ? 0.0f : 0.5f + 0.5f * cos_approx(d * (float)M_PI);
+}
+
+// Blend (or add) a soft blob of colour c centred on fractional position pos.
+// wrap: blob continues over the strip ends (for things circling the cloud).
+static void drawBlob(float pos, float radius, uint32_t c, uint8_t amount,
+                     bool additive = false, bool wrap = false) {
+  const int len = SEGLEN;
+  for (int i = 0; i < len; i++) {
+    float d = fabsf(i - pos);
+    if (wrap) d = fminf(d, len - d);
+    if (d >= radius) continue;
+    uint8_t w = (uint8_t)(hann(d / radius) * amount);
+    if (!w) continue;
+    uint32_t cur = SEGMENT.getPixelColor(i);
+    SEGMENT.setPixelColor(i, additive ? color_add(cur, color_fade(c, w))
+                                      : color_blend(cur, c, w));
+  }
+}
+
+static inline float randf() { return hw_random16() * (1.0f / 65536.0f); }
+
+// --- clear sky: blue sky with a warm sun travelling around the cloud ----------
+static void drawSun(float &sunPos, float dt) {
+  const int len = SEGLEN;
+  sunPos += dt * 0.5f; // ~0.5 LED/s, as tuned (1 LED per ~1.9 s)
+  if (sunPos >= len) sunPos -= len;
+  float radius = 4.0f + SEGMENT.intensity * (6.0f / 128.0f); // 128 -> 10 (20 px)
+  for (int i = 0; i < len; i++) {
+    float d = fabsf(i - sunPos);
+    d = fminf(d, len - d);
+    float w = hann(d / radius);
+    if (w <= 0.0f) continue;
+    uint8_t core = (uint8_t)(w * 255);
+    // warm yellow-white centre, yellow edge. Green is high on purpose: gamma 2.8
+    // pulls yellow towards orange (raw G 200 shows as ~130 = sunset orange)
+    uint32_t sun = color_blend(RGBW32(255, 225, 70, 0), RGBW32(255, 245, 130, 0), core);
+    SEGMENT.setPixelColor(i, color_blend(SEGMENT.getPixelColor(i), sun,
+                                         (uint8_t)min(255, core * 2)));
+  }
+}
+
+// deep sky blue with a very gentle brightness texture
+static void drawSky(uint32_t t) {
+  const int len = SEGLEN;
+  uint32_t sky = ambientColor(0, 191, 255);
+  for (int i = 0; i < len; i++) {
+    uint8_t n = weatherNoise(i * 4096, t);
+    SEGMENT.setPixelColor(i, color_fade(sky, 192 + (n >> 2)));
+  }
+}
+
 static void mode_clear_sky() {
-  static uint16_t clearSunPosition = 0;
-  static unsigned long clearLastUpdate = 0;
-
-  // Update sun position based on speed
-  if (millis() - clearLastUpdate > (255 - SEGMENT.speed) * 15) {
-    clearSunPosition++;
-    if (clearSunPosition >= SEGMENT.length()) {
-      clearSunPosition = 0;
-    }
-    clearLastUpdate = millis();
-  }
-
-  // Fill the sky with blue color
-  SEGMENT.fill(CRGB::DeepSkyBlue);
-
-  // Tapered sun glow: golden-yellow centre, orange edges
-  for (int i = 0; i < 20; i++) {
-    int pos = (clearSunPosition + i) % SEGMENT.length();
-    int dist = abs(i - 9); // 0 at centre, up to 9 at edges
-    uint8_t t = (uint8_t)(255 - dist * 205 / 9); // 255 at centre -> ~50 at edge
-    uint8_t g =
-        (uint8_t)(100 + (uint16_t)t * 100 / 255);  // 100-200: golden yellow
-    uint8_t b = (uint8_t)((uint16_t)t * 20 / 255); // 0-20: nearly no blue
-    SEGMENT.setPixelColor(pos, ((uint32_t)255 << 16) | ((uint32_t)g << 8) | b);
-  }
-
-  return;
+  static uint32_t last = 0, skyT = 0;
+  static float sunPos = 0;
+  float dt = weatherDelta(last);
+  advance(skyT, dt, 0.05f);
+  drawSky(skyT);
+  drawSun(sunPos, dt);
 }
 
-// Should be done
+// --- partly cloudy: sun and blue sky, drifting clouds covering most of it ----
 static void mode_partly_cloudy() {
-  static uint16_t partlyCloudySunPosition = 0;
-  static unsigned long partlyCloudyLastUpdate = 0;
-  static uint16_t blueSpotPositions[10] = {0}; // Store positions of blue spots
-  static uint8_t numBlueSpots = 0;
-  static unsigned long spotUpdateTime = 0;
+  static uint32_t last = 0, skyT = 0, drift = 0, evolve = 0;
+  static float sunPos = 0;
+  float dt = weatherDelta(last);
+  advance(skyT, dt, 0.05f);
+  advance(drift, dt, 0.08f);  // clouds drift along the cloud
+  advance(evolve, dt, 0.03f); // and slowly change shape
+  drawSky(skyT);
+  drawSun(sunPos, dt);
 
-  // Update sun position based on speed
-  if (millis() - partlyCloudyLastUpdate > (255 - SEGMENT.speed) * 15) {
-    partlyCloudySunPosition++;
-    if (partlyCloudySunPosition >= SEGMENT.length()) {
-      partlyCloudySunPosition = 0;
-    }
-    partlyCloudyLastUpdate = millis();
+  // Amount = cloud cover; 128 ~ 70% covered (grey with blue gaps, as before)
+  const int threshold = 233 - SEGMENT.intensity; // cloud where noise > threshold
+  uint32_t cloud = ambientColor(150, 150, 160);
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    int n = weatherNoise(i * 6554 + drift, evolve); // ~10 LEDs per noise cell
+    int a = constrain((n - threshold) * 5 + 128, 0, 255); // soft cloud edges
+    if (a)
+      SEGMENT.setPixelColor(i, color_blend(SEGMENT.getPixelColor(i), cloud, a));
   }
-
-  // Fill the sky with grey clouds
-  SEGMENT.fill(CRGB::Gray);
-
-  // Update blue spots every 3 seconds
-  if (millis() - spotUpdateTime > hw_random(15000, 20000)) {
-    numBlueSpots = hw_random8(2, 5); // Random number of spots
-    for (int i = 0; i < numBlueSpots; i++) {
-      blueSpotPositions[i] = hw_random16(SEGMENT.length());
-    }
-    spotUpdateTime = millis();
-  }
-
-  // Tapered sun glow: golden-yellow centre, orange edges
-  for (int i = 0; i < 20; i++) {
-    int pos = (partlyCloudySunPosition + i) % SEGMENT.length();
-    int dist = abs(i - 9);
-    uint8_t t = (uint8_t)(255 - dist * 205 / 9);
-    uint8_t g = (uint8_t)(100 + (uint16_t)t * 100 / 255);
-    uint8_t b = (uint8_t)((uint16_t)t * 20 / 255);
-    SEGMENT.setPixelColor(pos, ((uint32_t)255 << 16) | ((uint32_t)g << 8) | b);
-  }
-
-  // Draw blue spots with soft tapered edges to avoid hard cuts
-  for (int i = 0; i < numBlueSpots; i++) {
-    int spotSize = 7;
-    for (int j = 0; j < spotSize; j++) {
-      int pos = (blueSpotPositions[i] + j) % SEGMENT.length();
-      int distFromCenter = abs(j - spotSize / 2);
-      uint8_t alpha =
-          (uint8_t)(255 - distFromCenter * 255 / (spotSize / 2 + 1));
-      SEGMENT.setPixelColor(pos,
-                            color_blend(CRGB::Gray, CRGB::DeepSkyBlue, alpha));
-    }
-  }
-
-  return;
 }
 
-// done
+// --- cloudy: grey with slowly drifting lighter and darker areas ---------------
 static void mode_cloudy() {
-  // Very slow, subtle brightness variation to keep the cloud feeling alive
-  static uint16_t cloudPhase = 0;
-  cloudPhase++;
-  // One full cycle ~17 s at 30 fps (cloudPhase >> 1 advances phase by
-  // 0.5/frame)
-  uint8_t b = 70 + (uint8_t)((uint16_t)sin8_t(cloudPhase >> 1) * 90 /
-                             255); // 70-160: visible breathing
-  SEGMENT.fill(((uint32_t)b << 16) | ((uint32_t)b << 8) | b);
-  return;
+  static uint32_t last = 0, drift = 0, evolve = 0;
+  float dt = weatherDelta(last);
+  advance(drift, dt, 0.06f);
+  advance(evolve, dt, 0.03f);
+  // Amount = contrast between light and dark areas
+  const int contrast = SEGMENT.intensity; // 128 -> roughly 70..170
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    int n = weatherNoise(i * 5461 + drift, evolve) - 128;
+    int lvl = constrain(130 + n * contrast / 200, 75, 225); // floor stays visible after gamma
+    SEGMENT.setPixelColor(i, ambientColor(lvl, lvl, lvl + 8));
+  }
 }
 
-// --- Persistent raindrop state -----------------------------------------------
-#define NUM_RAINDROPS 6
-enum DropState { DROP_FADEIN = 0, DROP_SUSTAIN = 1, DROP_FADEOUT = 2 };
-
+// --- rain: blue-grey cloud with soft blue drops glowing up and fading ---------
+#define MAX_RAINDROPS 16
 struct Raindrop {
-  uint16_t pos;
-  uint8_t brightness;
-  uint8_t peakBright;
-  uint8_t fadeSpeed;
-  uint8_t sustainLeft;
-  DropState state;
+  float pos;
+  float bri;       // current brightness 0..255
+  float peak;      // peak brightness
+  float fadeRate;  // brightness units per second
+  float sustain;   // seconds left at peak
+  uint8_t state;   // 0 fade in, 1 sustain, 2 fade out
 };
 
-static Raindrop raindrops[NUM_RAINDROPS];
-
-static void spawnRaindrop(Raindrop &d, uint16_t numLeds, bool stagger) {
-  d.pos = hw_random16(numLeds);
-  d.peakBright = 70 + hw_random8(130); // 70-200
-  d.fadeSpeed = 8 + hw_random8(16);  // 8-24 per frame -> 270-830 ms fade at 30 fps
-  d.sustainLeft = 2 + hw_random8(8); // 2-10 frames at peak
-  d.state = DROP_FADEIN;
-  d.brightness = stagger ? hw_random8(d.peakBright) : 0;
-  if (stagger && d.brightness > d.peakBright / 2)
-    d.state = DROP_FADEOUT;
+static void spawnRaindrop(Raindrop &d, bool stagger) {
+  d.pos = randf() * (SEGLEN - 1);
+  d.peak = 70 + hw_random8(130);           // 70-200
+  d.fadeRate = 80.0f + hw_random8(160);    // ~0.3-2.5 s fades, as tuned
+  d.sustain = 0.2f + randf() * 0.8f;       // 0.2-1.0 s at peak
+  d.state = 0;
+  d.bri = stagger ? randf() * d.peak : 0;
 }
 
-// -----------------------------------------------------------------------------
 static void mode_raining() {
-  static bool initialized = false;
-  if (!initialized) {
-    for (int i = 0; i < NUM_RAINDROPS; i++)
-      spawnRaindrop(raindrops[i], SEGMENT.length(), true);
-    initialized = true;
+  static uint32_t last = 0, drift = 0;
+  static Raindrop drops[MAX_RAINDROPS];
+  static uint16_t initLen = 0;
+  if (initLen != SEGLEN) {
+    for (auto &d : drops) spawnRaindrop(d, true);
+    initLen = SEGLEN;
+  }
+  float dt = weatherDelta(last);
+  advance(drift, dt, 0.25f);
+
+  // moving darker/lighter rain curtains in the background
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    uint8_t n = weatherNoise(i * 8192 + drift, 0);
+    SEGMENT.setPixelColor(i, color_fade(ambientColor(30, 45, 100), 128 + (n >> 1)));
   }
 
-  const uint32_t bgColor = 0x06060C;   // dark stormy background
-  const uint32_t dropColor = 0x1040B0; // cool blue rain
-  SEGMENT.fill(bgColor);
-
-  for (int i = 0; i < NUM_RAINDROPS; i++) {
-    Raindrop &d = raindrops[i];
-
-    // Advance lifecycle
+  const int count = max(1, SEGMENT.intensity * 12 / 255); // 128 -> 6 drops
+  const uint32_t dropColor = RGBW32(0x10, 0x40, 0xB0, 0);
+  for (int i = 0; i < count && i < MAX_RAINDROPS; i++) {
+    Raindrop &d = drops[i];
     switch (d.state) {
-    case DROP_FADEIN:
-      if ((uint16_t)d.brightness + d.fadeSpeed >= d.peakBright) {
-        d.brightness = d.peakBright;
-        d.state = DROP_SUSTAIN;
-      } else {
-        d.brightness += d.fadeSpeed;
-      }
+    case 0:
+      d.bri += d.fadeRate * dt;
+      if (d.bri >= d.peak) { d.bri = d.peak; d.state = 1; }
       break;
-
-    case DROP_SUSTAIN:
-      if (d.sustainLeft > 0)
-        d.sustainLeft--;
-      else
-        d.state = DROP_FADEOUT;
+    case 1:
+      d.sustain -= dt;
+      if (d.sustain <= 0) d.state = 2;
       break;
-
-    case DROP_FADEOUT:
-      if (d.brightness <= d.fadeSpeed)
-        spawnRaindrop(d, SEGMENT.length(), false);
-      else
-        d.brightness -= d.fadeSpeed;
+    default:
+      d.bri -= d.fadeRate * dt;
+      if (d.bri <= 0) spawnRaindrop(d, false);
       break;
     }
-
-    // Render with soft 3-pixel spread centred on pos
-    int c = (int)d.pos;
-    uint8_t sideB = (uint8_t)((uint16_t)d.brightness * 35 / 100);
-    if (c > 0)
-      SEGMENT.setPixelColor(c - 1, color_blend(bgColor, dropColor, sideB));
-    SEGMENT.setPixelColor(c, color_blend(bgColor, dropColor, d.brightness));
-    if (c + 1 < (int)SEGMENT.length())
-      SEGMENT.setPixelColor(c + 1, color_blend(bgColor, dropColor, sideB));
+    drawBlob(d.pos, 2.0f, dropColor, (uint8_t)d.bri);
   }
-
-  return;
 }
 
-#define NUM_SNOWFLAKES 5
-
+// --- snow: soft white cloud, flakes drifting slowly and fading in/out ---------
+#define MAX_SNOWFLAKES 12
 struct Snowflake {
-  float pos;
-  float speed;
+  float pos, speed, age, life;
 };
 
-Snowflake snowflakes[NUM_SNOWFLAKES];
-
-void initSnowflakes(uint16_t numLeds) {
-  for (int i = 0; i < NUM_SNOWFLAKES; i++) {
-    snowflakes[i].pos = random(numLeds);
-    snowflakes[i].speed =
-        0.01f + 0.04f * (hw_random8() / 255.0f); // Speed between 0.01 and 0.05
-  }
+static void spawnSnowflake(Snowflake &f, bool stagger) {
+  f.pos = randf() * (SEGLEN - 1);
+  f.speed = 0.1f + randf() * 0.4f; // 0.1-0.5 LED/s, as tuned
+  f.life = 4.0f + randf() * 6.0f;  // visible for 4-10 s
+  f.age = stagger ? randf() * f.life : 0;
 }
 
 static void mode_snow() {
-  static bool initialized = false;
-  if (!initialized) {
-    initSnowflakes(SEGMENT.length());
-    initialized = true;
+  static uint32_t last = 0, drift = 0;
+  static Snowflake flakes[MAX_SNOWFLAKES];
+  static uint16_t initLen = 0;
+  if (initLen != SEGLEN) {
+    for (auto &f : flakes) spawnSnowflake(f, true);
+    initLen = SEGLEN;
+  }
+  float dt = weatherDelta(last);
+  advance(drift, dt, 0.04f);
+
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    uint8_t n = weatherNoise(i * 5461 + drift, 0);
+    SEGMENT.setPixelColor(i, color_fade(ambientColor(68, 72, 95), 170 + n / 3));
   }
 
-  // 1. Fill all LEDs with a very dim gray (darker cloud background)
-  for (uint16_t i = 0; i < SEGMENT.length(); i++) {
-    SEGMENT.setPixelColor(i, 0x050508); // Much dimmer bluish-gray
+  const int count = max(1, SEGMENT.intensity * 10 / 255); // 128 -> 5 flakes
+  for (int i = 0; i < count && i < MAX_SNOWFLAKES; i++) {
+    Snowflake &f = flakes[i];
+    f.age += dt;
+    f.pos += f.speed * dt;
+    if (f.age >= f.life || f.pos >= SEGLEN) spawnSnowflake(f, false);
+    // smooth fade in and out over the flake's life: no popping
+    uint8_t bri = (uint8_t)(255.0f * sin_approx(f.age / f.life * (float)M_PI));
+    drawBlob(f.pos, 2.5f, RGBW32(200, 200, 240, 0), bri, true);
   }
-
-  // 2. Move and draw snowflakes horizontally (draw OVER the background)
-  for (int i = 0; i < NUM_SNOWFLAKES; i++) {
-    // Sub-pixel 5-pixel Hann-window snowflake for smooth movement
-    float fpos = snowflakes[i].pos;
-    int centre = (int)fpos;
-    float frac = fpos - (float)centre;
-    const int hw = 2; // half-width: 5 pixels total
-    for (int w = -hw; w <= (hw + 1); w++) {
-      int led = centre + w;
-      if (led < 0 || led >= (int)SEGMENT.length())
-        continue;
-      float dist = fabsf((float)w - frac);
-      if (dist >= (float)hw)
-        continue;
-      uint8_t angle = (uint8_t)(dist * 128.0f / (float)hw);
-      uint8_t t = cos8_t(angle);
-      // Cold blue-white
-      uint8_t bl = (uint8_t)min(255, (int)t + (int)t / 5);
-      SEGMENT.setPixelColor(led, ((uint32_t)t << 16) | ((uint32_t)t << 8) |
-                                     (uint32_t)bl);
-    }
-
-    snowflakes[i].pos += snowflakes[i].speed;
-    if (snowflakes[i].pos >= SEGMENT.length()) {
-      snowflakes[i].pos = 0;
-      snowflakes[i].speed = 0.01f + 0.04f * (hw_random8() / 255.0f);
-    }
-  }
-
-  return;
 }
 
-struct LightningBolt {
-  uint32_t lastTime;
-  uint16_t interval;
-  uint16_t start;
-  uint16_t len;
-  uint8_t fade;
-};
-
-LightningBolt lightningBolt;
-
+// --- thunderstorm: dark storm cloud, lightning lights up regions of it ---------
 static void mode_thunderstorm() {
-  static uint8_t lightningCooldown = 0;
-  static uint8_t globalFlash = 0;
-  static uint32_t frame = 0;
-  frame++;
+  static uint32_t last = 0, drift = 0;
+  static uint32_t nextEvent = 0;  // time of next stroke on/off change
+  static uint8_t strokesLeft = 0; // remaining strokes of the current strike
+  static bool strokeOn = false;
+  static float centre = 0, radius = 0, flash = 0, strokeBri = 0;
+  static uint32_t lastFlashMs = 0;
+  float dt = weatherDelta(last);
+  const uint32_t now = strip.now;
+  const float realDt = min(200u, now - lastFlashMs) * 0.001f; // lightning timing ignores the speed slider
+  lastFlashMs = now;
+  advance(drift, dt, 0.3f);
+  const int len = SEGLEN;
 
-  // 1. Fill with dark stormy blue
-  for (uint16_t i = 0; i < SEGMENT.length(); i++) {
-    uint8_t flicker = hw_random8((uint16_t)(i * 31 + frame * 17)) %
-                      10; // pseudo-random per pixel per frame
-    SEGMENT.setPixelColor(i, ((0x00 + flicker) << 16) |
-                                 ((0x00 + flicker) << 8) |
-                                 (0x30 + flicker)); // dark blue
+  // dark, slowly churning storm cloud
+  for (int i = 0; i < len; i++) {
+    uint8_t n = weatherNoise(i * 6554 + drift, drift >> 2);
+    SEGMENT.setPixelColor(i, color_fade(ambientColor(40, 45, 125), 120 + n / 2));
   }
 
-  // 2. Occasionally trigger a global flash (big lightning)
-  if (hw_random8() < 3 && lightningCooldown == 0) {
-    globalFlash = 255;
-    lightningCooldown = hw_random8(10, 40); // Cooldown before next big flash
-  }
-
-  // 3. Fade global flash
-  if (globalFlash > 0) {
-    for (uint16_t i = 0; i < SEGMENT.length(); i++) {
-      SEGMENT.setPixelColor(
-          i, color_blend(SEGMENT.getPixelColor(i), 0xFFFFFF, globalFlash));
+  // Strike = 2-5 quick strokes at one place, like real lightning.
+  // Amount = how often it strikes (128 -> every ~1.5-6 s, like before).
+  if ((int32_t)(now - nextEvent) >= 0) {
+    if (strokeOn) { // end of a stroke
+      strokeOn = false;
+      if (--strokesLeft > 0) {
+        nextEvent = now + 40 + hw_random16(120); // gap between strokes
+      } else {
+        uint32_t pause = 1500 + hw_random16(4500);
+        nextEvent = now + pause * 128 / max(8, (int)SEGMENT.intensity);
+      }
+    } else { // start of a stroke
+      if (strokesLeft == 0) { // new strike
+        strokesLeft = 2 + hw_random8(4);
+        strokeBri = 255;
+        if (hw_random8() < 64) { // sheet lightning: whole cloud
+          centre = len / 2.0f;
+          radius = len;
+        } else {
+          centre = randf() * (len - 1);
+          radius = 6 + hw_random8(13); // 6-18 LEDs
+        }
+      } else { // later strokes: slightly weaker, branch a little
+        strokeBri *= 0.55f + randf() * 0.4f;
+        centre = constrain(centre + (randf() - 0.5f) * 6.0f, 0.0f, (float)(len - 1));
+      }
+      strokeOn = true;
+      flash = strokeBri;
+      nextEvent = now + 30 + hw_random16(90); // stroke duration
     }
-    globalFlash = (globalFlash > 40) ? globalFlash - 40 : 0;
   }
+  // afterglow: fade quickly after each stroke (independent of speed slider)
+  if (!strokeOn) flash = fmaxf(0.0f, flash - 1500.0f * realDt);
 
-  // 4. Occasionally trigger a lightning bolt
-  static uint8_t boltStrikesLeft = 0;
-  static bool boltPause = false; // true during pause between positions
-
-  uint32_t now = millis();
-  if (now - lightningBolt.lastTime > lightningBolt.interval) {
-    if (boltPause) {
-      // End pause, prepare for next position
-      boltPause = false;
-      boltStrikesLeft = 0; // Force new position on next strike
-      lightningBolt.interval =
-          400 + hw_random16(1200); // Normal interval for next strike (0.4-1.6s)
-    } else if (boltStrikesLeft == 0) {
-      // New position, but add a pause before starting
-      lightningBolt.start = hw_random16(SEGMENT.length() - 6);
-      lightningBolt.len = 3 + (hw_random8() % 6); // Length 3-8
-      boltStrikesLeft = 2 + (hw_random8() % 3);   // 2-4 strikes at this position
-      boltPause = true;
-      lightningBolt.interval =
-          800 + hw_random16(2000); // Pause between positions (0.8-2.8s)
-    } else {
-      // Continue striking at current position
-      lightningBolt.fade = 0;
-      lightningBolt.lastTime = millis();
-      lightningBolt.interval =
-          400 + hw_random16(1200); // Normal interval for next strike (0.4-1.6s)
-      boltStrikesLeft--;
+  if (flash > 1.0f) {
+    for (int i = 0; i < len; i++) {
+      float w = (radius >= len) ? 1.0f : hann((i - centre) / radius);
+      if (w <= 0.0f) continue;
+      uint8_t core = (uint8_t)(w * 255);
+      // warm white core, blue-violet halo
+      uint32_t c = color_blend(RGBW32(0xA0, 0xA0, 0xFF, 0), RGBW32(0xFF, 0xFF, 0xE0, 0), core);
+      SEGMENT.setPixelColor(i, color_blend(SEGMENT.getPixelColor(i), c,
+                                           (uint8_t)(w * flash)));
     }
-    lightningBolt.lastTime = millis();
-  }
-
-  // Draw and fade the bolt if active
-  if (lightningBolt.fade < 255 && !boltPause) {
-    for (uint16_t i = lightningBolt.start;
-         i < lightningBolt.start + lightningBolt.len && i < SEGMENT.length();
-         i++) {
-      SEGMENT.setPixelColor(i, color_blend(SEGMENT.getPixelColor(i), 0xFFFFCC,
-                                           255 - lightningBolt.fade));
-      if (i > 0)
-        SEGMENT.setPixelColor(i - 1, color_blend(SEGMENT.getPixelColor(i - 1),
-                                                 0xA0A0FF,
-                                                 128 - lightningBolt.fade / 2));
-      if (i + 1 < SEGMENT.length())
-        SEGMENT.setPixelColor(i + 1, color_blend(SEGMENT.getPixelColor(i + 1),
-                                                 0xA0A0FF,
-                                                 128 - lightningBolt.fade / 2));
-    }
-    lightningBolt.fade += 40;
-    if (lightningBolt.fade > 255)
-      lightningBolt.fade = 255;
-  }
-
-  // 5. Cooldown timer for global flash
-  if (lightningCooldown > 0)
-    lightningCooldown--;
-
-  return;
-}
-
-#define NUM_WIND_SPOTS 3
-
-struct WindSpot {
-  float pos;
-  float speed;
-  uint8_t width;
-};
-
-static WindSpot windSpots[NUM_WIND_SPOTS];
-
-// TODO wind still kinda bad and needs finetuning
-void initWindSpots(uint16_t numLeds) {
-  for (int i = 0; i < NUM_WIND_SPOTS; i++) {
-    // Spread spots evenly so the whole cloud is lit
-    windSpots[i].pos = (float)(numLeds / NUM_WIND_SPOTS * i) +
-                       hw_random16(numLeds / NUM_WIND_SPOTS);
-    windSpots[i].speed =
-        0.10f + 0.10f * (hw_random8() / 255.0f); // 0.10-0.20 per frame
-    windSpots[i].width = 8 + (hw_random8() % 5); // Half-width 8-12
   }
 }
 
+// --- wind: pale streaks rushing along the cloud in gusts ----------------------
 static void mode_wind() {
-  static bool initialized = false;
-  if (!initialized) {
-    initWindSpots(SEGMENT.length());
-    initialized = true;
+  static uint32_t last = 0, flow = 0, gustT = 0, evolve = 0;
+  float dt = weatherDelta(last);
+  advance(gustT, dt, 0.2f);
+  advance(evolve, dt, 0.2f);
+  // gust strength 0..1 changes slowly; Amount = how gusty it is
+  float gust = weatherNoise(gustT, 0x5A5A0000) / 255.0f;
+  float gustiness = SEGMENT.intensity / 128.0f;
+  float strength = constrain(0.4f + (gust - 0.5f) * 1.6f * gustiness, 0.15f, 1.0f);
+  advance(flow, dt, 0.5f * (0.5f + 1.5f * strength)); // ~3-16 LED/s depending on gusts
+
+  uint32_t base = ambientColor(45, 55, 80);
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    uint8_t n = weatherNoise(i * 8192 + flow, evolve);
+    // only the upper part of the noise forms bright streaks
+    int streak = constrain((n - 120) * 3, 0, 255);
+    uint8_t lvl = (uint8_t)(streak * (0.3f + 0.7f * strength) * (180.0f / 255.0f));
+    SEGMENT.setPixelColor(i, color_add(base, RGBW32(lvl, lvl, lvl + lvl / 8, 0)));
   }
-
-  // Dim stormy sky base
-  SEGMENT.fill(0x060810);
-
-  // Move and draw wind gusts with smooth Hann-window (cos8) profile
-  for (int s = 0; s < NUM_WIND_SPOTS; s++) {
-    windSpots[s].pos += windSpots[s].speed;
-    if (windSpots[s].pos >= SEGMENT.length())
-      windSpots[s].pos -= SEGMENT.length();
-
-    int hw = (int)windSpots[s].width; // half-width
-    int centre = (int)windSpots[s].pos;
-    for (int w = -hw; w <= hw; w++) {
-      int led = (centre + w + SEGMENT.length()) % SEGMENT.length();
-      // cos8: 255 at centre (angle=0), 0 at edge (angle=128)
-      uint8_t angle = (uint8_t)((uint32_t)abs(w) * 128 / hw);
-      uint8_t b = (uint8_t)((uint32_t)cos8_t(angle) * 180 / 255);
-      // Additive blend so overlapping spots combine naturally
-      uint32_t existing = SEGMENT.getPixelColor(led);
-      uint8_t er = (existing >> 16) & 0xFF;
-      uint8_t eg = (existing >> 8) & 0xFF;
-      uint8_t eb = existing & 0xFF;
-      SEGMENT.setPixelColor(led,
-                            ((uint32_t)min(255, (int)er + (int)b) << 16) |
-                                ((uint32_t)min(255, (int)eg + (int)b) << 8) |
-                                (uint32_t)min(255, (int)eb + (int)b));
-    }
-  }
-
-  return;
 }
 
-#define NUM_STARS 8 // Adjust as needed
-
+// --- night: deep blue cloud with softly twinkling stars ------------------------
+#define MAX_STARS 16
 struct Star {
-  uint16_t pos;
-  uint8_t phase;
-  uint8_t speed;
+  float pos, phase, speed;
 };
-
-Star stars[NUM_STARS];
-
-void initStars(uint16_t numLeds) {
-  for (int i = 0; i < NUM_STARS; i++) {
-    // Spread stars evenly so they cover the whole cloud
-    uint16_t segLen = numLeds / NUM_STARS;
-    stars[i].pos = (uint16_t)(segLen * i + (segLen > 1 ? hw_random16(segLen) : 0));
-    // Stagger initial phases so stars don't all brighten/dim together
-    stars[i].phase = (uint8_t)(i * 256 / NUM_STARS);
-    stars[i].speed =
-        1 + hw_random8(3); // 1-3 per frame -> ~4-12 s full cycle at 30 fps
-  }
-}
 
 static void mode_night() {
-  static bool initialized = false;
-  if (!initialized) {
-    initStars(SEGMENT.length());
-    initialized = true;
-  }
-
-  // Deep night sky - very dim blue backdrop
-  SEGMENT.fill(0x000008);
-
-  for (int i = 0; i < NUM_STARS; i++) {
-    stars[i].phase += stars[i].speed;
-    // sin8 returns 0..255; map to [20, 180] so stars are always faintly present
-    uint8_t b = 20 + (uint8_t)((uint16_t)sin8_t(stars[i].phase) * 160 / 255);
-    int c = (int)stars[i].pos;
-    // Soft 5-pixel gaussian-like spread: centre full, +-1 at 50%, +-2 at 12.5%
-    // Blend additively so overlapping stars combine gracefully
-    for (int w = -2; w <= 2; w++) {
-      int led = c + w;
-      if (led < 0 || led >= (int)SEGMENT.length())
-        continue;
-      uint8_t intensity;
-      switch (abs(w)) {
-      case 0:
-        intensity = b;
-        break; // centre
-      case 1:
-        intensity = b >> 1;
-        break; // 50 %
-      default:
-        intensity = b >> 3;
-        break; // 12.5 %
-      }
-      // Slightly blue-tinted white for a starlight feel
-      uint32_t existing = SEGMENT.getPixelColor(led);
-      uint8_t er = (existing >> 16) & 0xFF;
-      uint8_t eg = (existing >> 8) & 0xFF;
-      uint8_t eb = existing & 0xFF;
-      uint8_t bCh = (uint8_t)min(255, (int)intensity + intensity / 4);
-      SEGMENT.setPixelColor(led,
-                            ((uint32_t)min(255, (int)er + intensity) << 16) |
-                                ((uint32_t)min(255, (int)eg + intensity) << 8) |
-                                (uint32_t)min(255, (int)eb + (int)bCh));
+  static uint32_t last = 0;
+  static Star stars[MAX_STARS];
+  static uint16_t initLen = 0;
+  static uint8_t initCount = 0;
+  const int count = max(1, SEGMENT.intensity * 16 / 255); // 128 -> 8 stars
+  if (initLen != SEGLEN || initCount != count) {
+    // spread stars evenly so they cover the whole cloud
+    float spacing = (float)SEGLEN / count;
+    for (int i = 0; i < count; i++) {
+      stars[i].pos = spacing * i + randf() * spacing;
+      stars[i].phase = i * 256.0f / count; // staggered
+      stars[i].speed = 10.0f + randf() * 20.0f; // ~8-25 s twinkle, as tuned
     }
+    initLen = SEGLEN;
+    initCount = count;
   }
+  float dt = weatherDelta(last);
 
-  return;
-}
-
-#define NUM_FOG_BANKS 3
-
-struct FogBank {
-  float pos;
-  float speed;
-  uint8_t width;
-};
-
-static FogBank fogBanks[NUM_FOG_BANKS];
-
-// TODO improve this effect
-void initFogBanks(uint16_t numLeds) {
-  for (int i = 0; i < NUM_FOG_BANKS; i++) {
-    fogBanks[i].pos = random(numLeds);
-    fogBanks[i].speed = 0.01 + 0.03 * (hw_random8() / 255.0); // Very slow
-    fogBanks[i].width = 8 + (hw_random8() % 8);               // Wide banks
+  SEGMENT.fill(ambientColor(0, 6, 90));
+  for (int i = 0; i < count; i++) {
+    Star &s = stars[i];
+    s.phase += s.speed * dt;
+    if (s.phase >= 256.0f) s.phase -= 256.0f;
+    // always faintly present: 20..180
+    uint8_t b = 20 + (uint16_t)sin8_t((uint8_t)s.phase) * 160 / 255;
+    drawBlob(s.pos, 2.5f, RGBW32(255, 255, 255, 0), b, true);
   }
 }
 
+// --- fog: pale, low contrast, with wisps wafting through ----------------------
 static void mode_fog() {
-  static bool initialized = false;
-  if (!initialized) {
-    initFogBanks(SEGMENT.length());
-    initialized = true;
+  static uint32_t last = 0, drift = 0, evolve = 0, waft = 0, waftEvolve = 0;
+  static float swayPhase = 0;
+  float dt = weatherDelta(last);
+  advance(drift, dt, 0.04f);
+  advance(evolve, dt, 0.02f);
+  // wisps: a finer layer that glides along (~1 LED/s) and sways back and
+  // forth (~+-5 LEDs over ~12 s), like fog wafting past
+  advance(waft, dt, 0.12f);
+  advance(waftEvolve, dt, 0.06f);
+  swayPhase += dt * 0.5f;
+  if (swayPhase > 2.0f * (float)M_PI) swayPhase -= 2.0f * (float)M_PI;
+  const uint32_t sway = (uint32_t)((sin_approx(swayPhase) + 1.0f) * 0.6f * 65536.0f);
+
+  // Amount = density: denser fog is brighter and more uniform
+  const int centre = 90 + SEGMENT.intensity * 50 / 255;     // 128 -> 115
+  const int spread = 45 - SEGMENT.intensity * 25 / 255;     // 128 -> ~33
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    int n = weatherNoise(i * 4096 + drift, evolve) - 128;
+    int wisp = weatherNoise(i * 7282 + waft + sway, waftEvolve + 0x40000000);
+    int lvl = centre + n * spread / 128 + max(0, wisp - 140) * 45 / 115;
+    lvl = constrain(lvl, 30, 230);
+    SEGMENT.setPixelColor(i, ambientColor(lvl - 4, lvl, lvl + 4));
   }
-
-  // 1. Fill all LEDs with a very dim grayish base
-  for (uint16_t i = 0; i < SEGMENT.length(); i++) {
-    // SEGMENT.setPixelColor(i, 0x101012); // Very dim blue-gray
-    SEGMENT.setPixelColor(i, BLACK);
-  }
-
-  // 2. Overlay drifting fog banks
-  for (int f = 0; f < NUM_FOG_BANKS; f++) {
-    fogBanks[f].pos += fogBanks[f].speed;
-    if (fogBanks[f].pos >= SEGMENT.length())
-      fogBanks[f].pos -= SEGMENT.length();
-
-    for (int w = -fogBanks[f].width; w <= fogBanks[f].width; w++) {
-      int led =
-          ((int)fogBanks[f].pos + w + SEGMENT.length()) % SEGMENT.length();
-      // Very soft edge: center is 80, edges fade out
-      uint8_t brightness = 80 - abs(w) * (80 / (fogBanks[f].width + 1));
-      uint32_t col = ((uint32_t)brightness << 16) |
-                     ((uint32_t)brightness << 8) | brightness; // soft gray
-      SEGMENT.setPixelColor(
-          led, color_blend(SEGMENT.getPixelColor(led), col, brightness));
-    }
-  }
-
-  return;
 }
 
-#define NUM_HAILSTONES 3
-
+// --- hail: grey storm cloud pelted by short, bright icy flashes ----------------
+#define MAX_HAILSTONES 16
 struct Hailstone {
-  float pos;
-  float speed;
-  uint8_t width;
+  float pos, bri;
 };
-
-static Hailstone hailstones[NUM_HAILSTONES];
-
-void initHailstones(uint16_t numLeds) {
-  for (int i = 0; i < NUM_HAILSTONES; i++) {
-    hailstones[i].pos = random(numLeds);
-    hailstones[i].speed =
-        0.12f + 0.16f * (hw_random8() / 255.0f); // 0.12-0.28 per frame
-    hailstones[i].width = 2;
-  }
-}
 
 static void mode_hail() {
-  static bool initialized = false;
-  if (!initialized) {
-    initHailstones(SEGMENT.length());
-    initialized = true;
+  static uint32_t last = 0, drift = 0;
+  static Hailstone stones[MAX_HAILSTONES];
+  static float spawnBudget = 0;
+  float dt = weatherDelta(last);
+  advance(drift, dt, 0.3f);
+
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    uint8_t n = weatherNoise(i * 6554 + drift, 0);
+    SEGMENT.setPixelColor(i, color_fade(ambientColor(75, 77, 95), 150 + n / 3));
   }
 
-  // 1. Fill all LEDs with dark grey (stormy sky)
-  for (uint16_t i = 0; i < SEGMENT.length(); i++) {
-    SEGMENT.setPixelColor(i, 0x101014); // Darker grey
-  }
-
-  // 2. Move and draw hailstones
-  for (int h = 0; h < NUM_HAILSTONES; h++) {
-    hailstones[h].pos += hailstones[h].speed;
-    if (hailstones[h].pos >= SEGMENT.length()) {
-      hailstones[h].pos = 0;
-      hailstones[h].speed = 0.12f + 0.16f * (hw_random8() / 255.0f);
-      hailstones[h].width = 2;
+  // Amount = hail rate: 128 -> ~5 stones per second
+  spawnBudget += dt * 5.0f * SEGMENT.intensity / 128.0f;
+  for (auto &h : stones) {
+    if (h.bri <= 0 && spawnBudget >= 1.0f) {
+      h.pos = randf() * (SEGLEN - 1);
+      h.bri = 180 + hw_random8(76);
+      spawnBudget -= 1.0f;
     }
-    // Sub-pixel 5-pixel Hann-window hailstone for smooth movement
-    float fpos = hailstones[h].pos;
-    int centre = (int)fpos;
-    float frac = fpos - (float)centre;
-    const int hw = 2; // half-width: 5 pixels total
-    for (int w = -hw; w <= (hw + 1); w++) {
-      int led = centre + w;
-      if (led < 0 || led >= (int)SEGMENT.length())
-        continue;
-      float dist = fabsf((float)w - frac);
-      if (dist >= (float)hw)
-        continue;
-      uint8_t angle = (uint8_t)(dist * 128.0f / (float)hw);
-      uint8_t t = cos8_t(angle);
-      // Icy blue colour scaled by brightness
-      uint8_t r = (uint8_t)((uint32_t)0x21 * t / 255);
-      uint8_t g = (uint8_t)((uint32_t)0x62 * t / 255);
-      uint8_t b = (uint8_t)((uint32_t)0xA3 * t / 255);
-      SEGMENT.setPixelColor(led, ((uint32_t)r << 16) | ((uint32_t)g << 8) | b);
+    if (h.bri > 0) {
+      drawBlob(h.pos, 1.8f, RGBW32(52, 153, 255, 0), (uint8_t)h.bri, true);
+      h.bri -= 1100.0f * dt; // ~0.2 s flash
     }
   }
-
-  return;
+  if (spawnBudget > 3.0f) spawnBudget = 3.0f;
 }
-
-// TODO move all weather thingys into seperate files?
-
-// TODO commmit to my git and update fork afterwards
 
 /**
  * The all encompassing weather effect mode that picks the current weather on
  * itself
  */
 static void mode_weather() {
-
-  // seg.setOption(SEG_OPTION_ON, true);
-
   switch (currentWeatherAnimation) {
-  case ANIM_CLEAR:
-    return mode_clear_sky();
-    break;
-  case ANIM_PARTLY_CLOUDY:
-    return mode_partly_cloudy();
-    break;
-  case ANIM_CLOUDY:
-    return mode_cloudy();
-    break;
-  case ANIM_RAIN:
-    return mode_raining();
-    break;
-  case ANIM_SNOW:
-    return mode_snow();
-    break;
-  case ANIM_THUNDERSTORM:
-    return mode_thunderstorm();
-    break;
-  case ANIM_FOG:
-    return mode_fog();
-    break;
-  case ANIM_WIND:
-    return mode_wind();
-    break;
-  case ANIM_NIGHT:
-    return mode_night();
-    break;
-  case ANIM_HAIL:
-    return mode_hail();
-    break;
-  // none and default defaulting to full red error cloud
+  case ANIM_CLEAR:         return mode_clear_sky();
+  case ANIM_PARTLY_CLOUDY: return mode_partly_cloudy();
+  case ANIM_CLOUDY:        return mode_cloudy();
+  case ANIM_RAIN:          return mode_raining();
+  case ANIM_SNOW:          return mode_snow();
+  case ANIM_THUNDERSTORM:  return mode_thunderstorm();
+  case ANIM_FOG:           return mode_fog();
+  case ANIM_WIND:          return mode_wind();
+  case ANIM_NIGHT:         return mode_night();
+  case ANIM_HAIL:          return mode_hail();
   case ANIM_NONE:
   default:
-    for (unsigned i = 0; i < strip.getSegmentsNum(); i++) {
-      Segment &seg = strip.getSegment(i);
-      if (!seg.isActive())
-        continue;
-      // DEBUG_PRINT(F("No fitting mode found. Defaulting to error state!"));
-      seg.fill_solid((uint32_t)0xFF0000);
-      // seg.setColor(0, (uint32_t)0xFF0000);
-      // seg.setMode(FX_MODE_STATIC);
-    }
-
+    // no (valid) weather data: red error cloud
+    SEGMENT.fill(RED);
     break;
   }
-  // DEBUG_PRINT(F("New mode id: "));
-  // DEBUG_PRINTLN(seg.currentMode());
-
-  return;
 }
 
 class WeatherCloudMod : public Usermod {
